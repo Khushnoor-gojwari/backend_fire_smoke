@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+ultralytics
+opencv-python
+python-multipart
+requests
+numpy
+Pillow
+ffmpeg-python
+beautifulsoup4

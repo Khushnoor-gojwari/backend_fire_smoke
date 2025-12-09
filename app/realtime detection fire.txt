@@ -1,0 +1,437 @@
+OPTIMIZED REALTIME DETECTION WORKFLOW DIAGRAM
+──────────────────────────────────────────────────────────────────────────────
+FRONTEND (React - LiveDetect Component)     BACKEND (FastAPI - WebSocket Server)
+──────────────────────────────────────────────────────────────────────────────
+
+┌────────────────────────────────────┐     ┌─────────────────────────────────────┐
+│         INITIALIZATION             │     │      CONNECTION MANAGER             │
+│ 1. Component mounts               │     │ 1. Create ThreadPoolExecutor        │
+│ 2. Check device type (mobile/desk)│     │    - 4 worker threads              │
+│ 3. Request camera permissions     │     │ 2. Initialize data structures:      │
+│ 4. Enumerate available cameras    │     │    - frame_queues: {client_id: deque│
+│ 5. Set up state & refs           │     │    - processing_flags: {client_id}   │
+│    - videoRef, canvasRef, wsRef  │     │    - last_processed: {client_id: ts} │
+│    - streamRef, animationFrameRef│     │    - frame_counter: {client_id}      │
+└─────────────────┬──────────────────┘     └─────────────────┬──────────────────┘
+                  │                                           │
+                  │ POST /api/realtime/stream (WebSocket)    │
+                  │──────────────────────────────────────────>│
+                  │                                           │
+                  │                                          ││ 3. Accept connection
+                  │                                          ││ 4. Generate client_id
+                  │                                          ││ 5. Initialize queues
+                  │<──────────────────────────────────────────│
+                  │        WebSocket connected               │
+                  │                                           │
+┌─────────────────▼──────────────────┐     ┌─────────────────▼──────────────────┐
+│    START DETECTION (User clicks)   │     │                                   │
+│ 1. GetUserMedia() for camera      │     │                                   │
+│ 2. Set videoRef.srcObject = stream│     │                                   │
+│ 3. video.play()                   │     │                                   │
+│                                   │     │                                   │
+│    ┌──────────────────────────┐   │     │                                   │
+│    │    RENDER LOOP (30 FPS)  │   │     │                                   │
+│    │  ┌────────────────────┐  │   │     │                                   │
+│    │  │requestAnimationFrame├─┼───┼────▶│                                   │
+│    │  └──────┬─────────────┘  │   │     │                                   │
+│    │         │                 │   │     │                                   │
+│    │         ▼                 │   │     │                                   │
+│    │  ctx.drawImage(video)     │   │     │                                   │
+│    │  Draw video frame to canvas│   │     │                                   │
+│    │                           │   │     │                                   │
+│    │  ┌────────────────────┐   │   │     │                                   │
+│    │  │ Draw detections     │   │   │     │                                   │
+│    │  │ from detectionData   │   │   │     │                                   │
+│    │  └────────────────────┘   │   │     │                                   │
+│    └──────────────────────────┘   │     │                                   │
+│                                   │     │                                   │
+│    ┌──────────────────────────┐   │     │                                   │
+│    │    SEND LOOP (30 FPS)    │   │     │                                   │
+│    │  setInterval(33ms)       │   │     │                                   │
+│    └──────┬───────────────────┘   │     │                                   │
+│           │                        │     │                                   │
+│           ▼                        │     │                                   │
+│    ┌──────────────┐               │     │                                   │
+│    │FRAME SKIPPING│               │     │                                   │
+│    │ LOGIC        │               │     │                                   │
+│    └──────┬───────┘               │     │                                   │
+│           │                        │     │                                   │
+│           ├─ frameCounter++        │     │                                   │
+│           ├─ if counter % 15 != 0: │     │                                   │
+│           │    SKIP FRAME          │     │                                   │
+│           ├─ timeSinceLast < 500ms:│     │                                   │
+│           │    SKIP FRAME          │     │                                   │
+│           └─ Send frame            │     │                                   │
+│                                    │     │                                   │
+│           canvas.toDataURL(0.6)    │     │                                   │
+│           └─ JPEG quality 60%      │     │                                   │
+│                                    │     │                                   │
+│    {"frame": "data:image/jpeg...", │     │                                   │
+│     "timestamp": 1634567890.123}   │     │                                   │
+│    ────────────────────────────────┼────▶│                                   │
+│                                    │     │                                   │
+│                                    │     │┌────────────────────────────────┐│
+│                                    │     ││   FRAME RECEIVED              ││
+│                                    │     ││ 1. Decode base64 → OpenCV     ││
+│                                    │     ││ 2. Add to frame_queue         ││
+│                                    │     ││    (deque, maxlen=2)          ││
+│                                    │     ││    - Only keep latest 2 frames││
+│                                    │     │└────────────┬───────────────────┘│
+│                                    │     │             │                    │
+│                                    │     │             ▼                    │
+│                                    │     │┌────────────────────────────────┐│
+│                                    │     ││  PROCESSING DECISION          ││
+│                                    │     ││ 1. frame_counter[client]++    ││
+│                                    │     ││ 2. if counter % 15 != 0:      ││
+│                                    │     ││    {"status": "frame_received"}││
+│                                    │     ││ 3. time_since_last < 500ms:   ││
+│                                    │     ││    SKIP PROCESSING            ││
+│                                    │     ││ 4. if processing_flag[client]:││
+│                                    │     ││    SKIP (already processing)  ││
+│                                    │     │└────────────┬───────────────────┘│
+│                                    │     │             │                    │
+│                                    │     │             ▼                    │
+│                                    │     │┌────────────────────────────────┐│
+│                                    │     ││  THREAD POOL PROCESSING       ││
+│                                    │     ││ executor.submit(               ││
+│                                    │     ││   process_frame_async,         ││
+│                                    │     ││   frame, client_id, timestamp  ││
+│                                    │     ││ )                              ││
+│                                    │     ││                                ││
+│                                    │     ││  ┌──────────────────────────┐ ││
+│                                    │     ││  │ Worker Thread 1         │ ││
+│                                    │     ││  │ model(frame, conf=0.4)  │ ││
+│                                    │     ││  │ → Get detections         │ ││
+│                                    │     ││  │ → Classify fire/smoke    │ ││
+│                                    │     ││  └──────────┬───────────────┘ ││
+│                                    │     ││  ┌──────────▼───────────────┐ ││
+│                                    │     ││  │ Worker Thread 2         │ ││
+│                                    │     ││  │ model(frame, conf=0.4)  │ ││
+│                                    │     ││  │ → Get detections         │ ││
+│                                    │     ││  │ → Classify fire/smoke    │ ││
+│                                    │     ││  └──────────┬───────────────┘ ││
+│                                    │     ││             ...               ││
+│                                    │     │└──────────────┬────────────────┘│
+│                                    │     │               │                  │
+│                                    │     │               ▼                  │
+│                                    │     │┌────────────────────────────────┐│
+│                                    │     ││  POST-PROCESSING              ││
+│                                    │     ││ 1. Draw boxes on frame        ││
+│                                    │     ││ 2. Encode → base64 (60% qual) ││
+│                                    │     ││ 3. Create alert message       ││
+│                                    │     ││ 4. Prepare response JSON      ││
+│                                    │     │└──────────────┬────────────────┘│
+│                                    │     │               │                  │
+│                                    │     │               ▼                  │
+│                                    │     │┌────────────────────────────────┐│
+│                                    │     ││  SEND RESPONSE TO CLIENT      ││
+│                                    │     ││ {                             ││
+│                                    │     ││   "detections": [...],        ││
+│                                    │     ││   "fire_detected": true,      ││
+│                                    │     ││   "smoke_detected": false,    ││
+│                                    │     ││   "alert": "🔥 FIRE DETECTED!",││
+│                                    │     ││   "detection_count": 2,       ││
+│                                    │     ││   "timestamp": 1634567890.123,││
+│                                    │     ││   "processing_time": 0.45,    ││
+│                                    │     ││   "voice_alert": "...",       ││
+│                                    │     ││   "annotated_frame": "data:..."││
+│                                    │     ││ }                             ││
+│                                    │     │└──────────────┬────────────────┘│
+│                                    │     │               │                  │
+│    <─────────────────────────────────────────┼────────────┘                  │
+│                                    │     │                                   │
+│    ┌──────────────────────────┐   │     │                                   │
+│    │   HANDLE RESPONSE        │   │     │                                   │
+│    │ 1. Parse JSON            │   │     │                                   │
+│    │ 2. Update state:         │   │     │                                   │
+│    │    - detectionData       │   │     │                                   │
+│    │    - fireDetected        │   │     │                                   │
+│    │    - smokeDetected       │   │     │                                   │
+│    │    - alert               │   │     │                                   │
+│    │ 3. Update stats:         │   │     │                                   │
+│    │    - framesProcessed++   │   │     │                                   │
+│    │    - processingTimes     │   │     │                                   │
+│    │ 4. If voice_enabled:     │   │     │                                   │
+│    │    speechSynthesis.speak()│   │     │                                   │
+│    └──────────────────────────┘   │     │                                   │
+│                                    │     │                                   │
+│    ┌──────────────────────────┐   │     │                                   │
+│    │    STATS UPDATE LOOP     │   │     │                                   │
+│    │  setInterval(1000ms)     │   │     │                                   │
+│    │ 1. Calculate current FPS │   │     │                                   │
+│    │ 2. Update stats display  │   │     │                                   │
+│    └──────────────────────────┘   │     │                                   │
+│                                    │     │                                   │
+└────────────────────────────────────┘     └─────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         DATA FLOW SUMMARY                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ FRONTEND → BACKEND:                                                        │
+│ 1. WebSocket connect                                                       │
+│ 2. JPEG frames (base64, 60% quality)                                       │
+│ 3. Frame metadata (timestamp)                                              │
+│                                                                             │
+│ BACKEND → FRONTEND:                                                        │
+│ 1. Acknowledgement {"status": "frame_received"} (for skipped frames)       │
+│ 2. Detection results with:                                                 │
+│    - Bounding boxes                                                        │
+│    - Fire/smoke flags                                                      │
+│    - Alert messages                                                        │
+│    - Annotated frame (when detections found)                               │
+│    - Processing statistics                                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      PERFORMANCE OPTIMIZATIONS                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. FRAME SKIPPING: Only process 2 FPS (skip 14/15 frames at 30 FPS)        │
+│ 2. THREAD POOL: 4 workers process frames concurrently                      │
+│ 3. FRAME QUEUE: Only keep latest 2 frames, drop old ones                   │
+│ 4. MINIMUM INTERVAL: 500ms between processing for same client              │
+│ 5. LOW QUALITY: 60% JPEG quality for faster encoding/decoding              │
+│ 6. ANIMATION FRAMES: Smooth 30 FPS display using requestAnimationFrame     │
+│ 7. SEPARATE LOOPS: Render (30 FPS) vs Send (30 FPS) vs Process (2 FPS)     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      STATE MANAGEMENT                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ FRONTEND STATE:                                                            │
+│ - isRunning: Detection active                                              │
+│ - detectionData: Latest detection results                                  │
+│ - fireDetected/smokeDetected: Boolean flags                                │
+│ - stats: Performance metrics (FPS, frames sent, etc.)                      │
+│                                                                             │
+│ BACKEND STATE (per client):                                                │
+│ - frame_queue: deque(maxlen=2) - Latest frames                             │
+│ - processing_flag: Boolean - Prevent concurrent processing                 │
+│ - last_processed: Timestamp - Throttle processing                          │
+│ - frame_counter: Integer - Skip frames                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+IMAGE UPLOAD DETECTION PROCESS
+──────────────────────────────────────────────────────────────────────────────
+FRONTEND (React)                                    BACKEND (FastAPI)
+──────────────────────────────────────────────────────────────────────────────
+
+1. User selects image file
+   │
+2. FileReader reads image → creates base64 preview
+   │
+3. User clicks "Detect Objects"
+   │
+4. Create FormData with image file
+   │
+5. Send POST request to:                ← HTTP POST /api/image/upload/combined
+   - Endpoint: http://localhost:8000/api/image/upload/combined
+   - Body: FormData with image file
+   - Headers: multipart/form-data
+   │
+   │                                    → 1. Validate file type (must be image)
+   │                                         │
+   │                                         │ 2. Read uploaded file bytes
+   │                                         │
+   │                                         │ 3. Convert original to base64
+   │                                         │    for response
+   │                                         │
+   │                                         │ 4. Run YOLO inference:
+   │                                         │    - Load model (conf=0.1)
+   │                                         │    - Decode image → OpenCV format
+   │                                         │    - Detect fire/smoke
+   │                                         │
+   │                                         │ 5. Process results:
+   │                                         │    - Extract bounding boxes
+   │                                         │    - Set fire/smoke flags
+   │                                         │    - Draw boxes on image
+   │                                         │
+   │                                         │ 6. Encode annotated image → base64
+   │                                         │
+   │                                    ← 7. Send JSON response:
+   │                                       {
+   │                                         "original_image": "data:image/jpeg;base64,...",
+   │                                         "annotated_image": "data:image/jpeg;base64,...",
+   │                                         "detections": [...],
+   │                                         "fire_detected": true/false,
+   │                                         "smoke_detected": true/false,
+   │                                         "filename": "...",
+   │                                         "detection_count": N
+   │                                       }
+   │
+6. Receive response →
+   │
+7. Update React state with:
+   - fire/smoke flags
+   - detection array
+   - annotated image base64
+   │
+8. Display results:
+   - Show fire/smoke alerts
+   - List detected objects
+   - Side-by-side image comparison
+   │
+9. Optional: Download processed images
+
+
+
+VIDEO DETECTION PROCESS
+──────────────────────────────────────────────────────────────────────────────
+FRONTEND (React)                                    BACKEND (FastAPI)
+──────────────────────────────────────────────────────────────────────────────
+
+1. User selects video file
+   │
+2. User clicks "Upload Video"
+   │
+3. Create FormData with video file
+   │
+4. Send POST to:                            ← HTTP POST /api/video/upload
+   - Endpoint: http://localhost:8000/api/video/upload
+   - Body: FormData with video file
+   │
+   │                                    → 1. Validate file type (must be video)
+   │                                         │
+   │                                         │ 2. Generate unique task_id (8-char UUID)
+   │                                         │
+   │                                         │ 3. Save video to temp directory:
+   │                                         │    /temp_videos/{task_id}_original.mp4
+   │                                         │
+   │                                         │ 4. Extract first frame → create base64 preview
+   │                                         │
+   │                                         │ 5. Store task info in processing_tasks dict
+   │                                         │
+   │                                    ← 6. Return response with task_id and preview:
+   │                                       {
+   │                                         "task_id": "abc123de",
+   │                                         "preview": "data:image/jpeg;base64,...",
+   │                                         "filename": "video.mp4",
+   │                                         "message": "Video uploaded successfully"
+   │                                       }
+   │
+5. Receive response →
+   │
+6. Update state with task_id and preview
+   │
+7. User clicks "Process Video"
+   │
+8. Send POST to:                            ← HTTP POST /api/video/process/{task_id}
+   - Endpoint: http://localhost:8000/api/video/process/{task_id}
+   │
+   │                                    → 1. Verify task exists and not already processing
+   │                                         │
+   │                                         │ 2. Start background task
+   │                                         │    (FastAPI BackgroundTasks)
+   │                                         │
+   │                                    ← 3. Return immediate response:
+   │                                       {"message": "Processing started"}
+   │
+9. Start polling status every 2 seconds
+   │
+10. Send GET to:                            ← HTTP GET /api/video/status/{task_id}
+    - Endpoint: http://localhost:8000/api/video/status/{task_id}
+    │
+    │                                    → 1. Check processing_tasks dict
+    │                                         │
+    │                                         │ 2. Return current status:
+    │                                         │    - If "processing": progress %
+    │                                         │    - If "completed": full results
+    │                                         │    - If "error": error message
+    │
+    │                                    ← 3. Status response varies:
+    │                                       "uploaded" state:
+    │                                       {
+    │                                         "task_id": "...",
+    │                                         "status": "uploaded",
+    │                                         "progress": 0,
+    │                                         "preview": "...",
+    │                                         "filename": "..."
+    │                                       }
+    │
+    │                                       "processing" state:
+    │                                       {
+    │                                         "task_id": "...",
+    │                                         "status": "processing",
+    │                                         "progress": 45,  // percentage
+    │                                         "preview": "..."
+    │                                       }
+    │
+    │                                       "completed" state:
+    │                                       {
+    │                                         "task_id": "...",
+    │                                         "status": "completed",
+    │                                         "output_path": "...",
+    │                                         "stream_url": "...",
+    │                                         "processed_preview": "data:image/jpeg;base64,...",
+    │                                         "fire_detected": true/false,
+    │                                         "smoke_detected": true/false,
+    │                                         "download_url": "...",
+    │                                         "frame_count": 1500,
+    │                                         "duration": 50.5,
+    │                                         "detection_count": 234
+    │                                       }
+    │
+11. When status = "completed":
+    - Stop polling
+    - Update state with results
+    - Show detection alerts
+    - Display processed video preview
+    │
+12. User can:
+    - View processed preview image
+    - Stream processed video
+    - Download processed video
+
+──────────────────────────────────────────────────────────────────────────────
+BACKGROUND PROCESSING (process_video_task function)
+──────────────────────────────────────────────────────────────────────────────
+1. Load YOLO model once
+   │
+2. Open video file:
+   - Get FPS (default to 30 if 0)
+   - Get width/height
+   │
+3. Create output video writer:
+   - Codec: mp4v
+   - Same FPS, width, height as input
+   │
+4. Process each frame:
+   │
+   ├─ For each frame:
+   │  ├─ Run YOLO inference
+   │  ├─ Extract detections (fire/smoke)
+   │  ├─ Update detection counters
+   │  ├─ Save first frame with detections for preview
+   │  ├─ Draw bounding boxes on frame
+   │  └─ Write frame to output video
+   │
+   ├─ Update progress percentage:
+   │  progress = (current_frame / total_frames) * 100
+   │
+   └─ After all frames:
+      - Close video files
+      - Create processed preview from first detected frame
+      - Update task status to "completed"
+      - Store all metadata
+
+──────────────────────────────────────────────────────────────────────────────
+KEY FEATURES:
+──────────────────────────────────────────────────────────────────────────────
+• Asynchronous Processing: Uses BackgroundTasks for non-blocking processing
+• Progress Tracking: Real-time progress percentage updates
+• State Persistence: Tasks stored in memory (processing_tasks dict)
+• Preview Images: Both original and processed first frames as base64
+• Dual Access: Stream for playback + download for saving
+• Comprehensive Metadata: Frame count, duration, detection counts
+• Error Handling: Graceful error states and recovery
+• Resume Capability: Frontend can resume monitoring if page reloaded
+• Temporary Storage: Files stored in /temp_videos/ directory
+
+──────────────────────────────────────────────────────────────────────────────
+DIFFERENCES FROM IMAGE DETECTION:
+──────────────────────────────────────────────────────────────────────────────
+• Multi-step process: Upload → Process → Results (vs single step for images)
+• Background processing: Can take minutes for long videos
+• Progress tracking: Real-time updates via polling
+• Video streaming: Special endpoints for playback
+• Frame-by-frame analysis: Processes every video frame
+• State in memory: Backend stores tasks in dict (not persistent)
+• Preview extraction: Creates preview images from video
