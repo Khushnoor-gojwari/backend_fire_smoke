@@ -9,7 +9,7 @@ app = FastAPI(title="Fire & Smoke Detection API")
 # CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://192.168.1.2:3000"],
+    allow_origins=["http://localhost:3000", "http://192.168.1.2:3000" , "https://fire-frontend-roan.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
